@@ -1,0 +1,255 @@
+#! /usr/bin/python
+#
+# ssh-fix
+#
+# Fix your sshd_config and ssh_config wrt current best practice
+# wrt which ciphers and algorithms to use
+#
+# (c) 2016, Jens Svalgaard Kohrt, github@svalgaard.net
+#
+
+import subprocess
+import optparse  # not argparse as we want to be able to run on old systems
+import sys
+import re
+import difflib
+import datetime
+import shutil
+import os
+
+SSH = 'ssh'
+CONFIG_FILES = ['/etc/ssh/sshd_config', '/etc/ssh/ssh_config']
+VERBOSE = 0
+KEY_OPTS = [('Ciphers', 'cipher'), ('MACs', 'mac'), ('KexAlgorithms', 'kex')]
+
+
+def info(*msg):
+    sys.stdout.write(' '.join(msg)+'\n')
+
+
+def debug(*msg):
+    if VERBOSE > 0:
+        info(*msg)
+
+
+def fail(*msg):
+    info(*msg)
+    sys.exit(1)
+
+
+def confirm(text):
+    while True:
+        try:
+            answer = raw_input(text + ' (Y, N or Ctrl-C) ').lower() or ' '
+            if answer[0] in 'yn':
+                return answer[0] == 'y'
+        except KeyboardInterrupt:
+            fail()
+
+
+def getOutputOfCommand(cmd):
+    assert(cmd and type(cmd) in [tuple, list])
+    debug('Running command: %r' % ' '.join(cmd))
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    data = p.stdout.read()
+    return (data, p.wait())
+
+
+def getAlgorithms():
+    '''Get list of available algorithms/ciphers on this computer'''
+    algs = {}
+
+    q, _ = getOutputOfCommand(('ssh',))
+    if q and '-Q' in q:
+        debug('Your version of ssh(d) supports -Q')
+        for key, opt in KEY_OPTS:
+            d, err = getOutputOfCommand(('ssh', '-Q', opt))
+            if err or not d or not d.strip():
+                info('No ciphers/algorithms of type %s?' % key)
+                # algs[key] = [] - do NOT set anything later
+            else:
+                algs[key] = d.strip().split()
+    else:
+        info('This version of ssh(d) does not support -Q')
+        info('Using output of sshd -T, which may not include all available'
+             ' ciphers.')
+
+        # Use output of sshd -T
+        setup, err = getOutputOfCommand(('sshd', '-T'))
+        if err or not setup:
+            fail('Could not get output of sshd -T. You are either not running'
+                 ' as root OR your sshd is too old')
+
+        for key, opt in KEY_OPTS:
+            skey = key.lower()
+            algos = re.findall('^(?:%s) (.*)' % skey, setup, re.MULTILINE)
+            if len(algos) != 1:
+                info('No ciphers/algorithms of type %s' % key)
+                # algs[key] = [] - do NOT set anything later
+            else:
+                algs[key] = algos[0].split(',')
+
+    return algs
+
+
+def filterCiphers(algos):
+    for k in algos.keys():
+        algs = algos[k]
+        for alg in algs[:]:
+            algl = alg.lower()
+            for st in ['cbc', 'sha1', 'md5', 'arcfour']:
+                if st in algl:
+                    debug(k, 'Ignoring cipher/alg', alg)
+                    algs.remove(alg)
+                    break
+        for alg in algs:
+            debug(k, 'Using cipher/alg', alg)
+        algos[k] = algs
+
+
+def findLine(lines, text):
+    '''Find index of first line starting with text'''
+    for i, line in enumerate(lines):
+        if re.match(r'^\s*%s\s(?i)' % text, line):
+            debug(text, 'found in line #', str(i))
+            return i
+    debug(text, 'Not found')
+    return -1
+
+
+def fixConfig(algos, config_file):
+    try:
+        debug('Trying to read', config_file)
+        conf = open(config_file).read()
+    except IOError:
+        conf = None
+
+    if conf is None:
+        print
+        info('Could not read current %s file' % config_file)
+        info('Add the following output to the file yourself')
+        info()
+        for k, v in sorted(algos.items()):
+            info(k, ','.join(v))
+        return
+
+    lines = [line + '\n' for line in conf.split('\n')]
+    lineso = lines[:]
+    extraLines = []
+    for key, algs in sorted(algos.items()):
+        i = findLine(lines, key)
+        newLine = '%s %s\n' % (key, ','.join(algs))
+        if i < 0:
+            # Not already there
+            extraLines.append(newLine)
+        else:
+            lines[i] = newLine
+
+    if extraLines:
+        # Do we have a Match or Host section in conf?
+        # If yes, the extra lines MUST be added before these lines
+        ms = findLine(lines, 'Match')
+        mh = findLine(lines, 'Host')
+        if mh >= 0:
+            if ms < 0:
+                ms = mh
+            else:
+                ms = min(ms, mh)
+        if ms < 0:
+            lines.extend(['\n'] + extraLines)
+        else:
+            lines[ms:ms] = ['\n'] + extraLines + ['\n']
+
+    if lineso == lines:
+        info('Nothing to update. Your', config_file,
+             'is already ok')
+        return
+
+    # Show diff
+    print ''.join(difflib.unified_diff(lineso, lines, config_file,
+                                       config_file + '-new'))
+
+    datesuffix = datetime.datetime.now().strftime('%Y.%m.%d-%H.%M.%S')
+
+    tfn = 'sshd_config.bak-' + datesuffix
+    if not confirm('Apply the above diff to %s?' % config_file):
+        # copy new file to
+        open(tfn, 'w').write(''.join(lines))
+        info('Contents written to', tfn)
+        return
+
+    # Apply changes locally
+    nfn = config_file + '-new'
+    info('Writing new config to', nfn)
+    # Note that there is a small window here where other users
+    # can read the contents of nfn (if its not already readable)
+    ost = os.stat(config_file)
+    try:
+        open(nfn, 'w').write(''.join(lines))
+    except IOError:
+        info('Unable to write new config file.')
+        fail('You probably have to run this as root (use sudo)')
+    os.chown(nfn, ost.st_uid, ost.st_gid)
+    os.chmod(nfn, ost.st_mode)
+
+    bfn = config_file + '-bak-' + datesuffix
+    info('Renaming', config_file, 'to', bfn)
+    os.rename(config_file, bfn)
+
+    info('Renaming', nfn, 'to', config_file)
+    os.rename(nfn, config_file)
+
+    if 'sshd' in config_file:
+        # maybe restart service
+        if os.path.isfile('/usr/bin/systemctl'):
+            cmd = ('/usr/bin/systemctl', 'restart', 'sshd.service')
+        elif os.path.isfile('/etc/init.d/sshd'):
+            cmd = ('/etc/init.d/sshd', 'restart')
+        else:
+            info('Remember to restart sshd to apply the changes')
+            return
+
+        info(*cmd)
+        if confirm('Restart sshd by running the above command?'):
+            os.system(' '.join(cmd))
+    return True
+
+
+def main():
+    global VERBOSE
+
+    cff = ', '.join(CONFIG_FILES)
+
+    parser = optparse.OptionParser(
+        description='Fix %s wrt securify issues' % cff)
+    parser.add_option('--verbose', '-v',
+                      action='store_true',
+                      help='be extra verbose')
+    parser.add_option('--config-file', '-c', metavar='SSHD_CONFIG',
+                      default=[], action='append',
+                      help='which sshd_config file to look at (default '
+                      '%s). Can be used more than once' % cff)
+
+    options, args = parser.parse_args()
+    if args:
+        parser.error('No position arguments allowed')
+    if not options.config_file:
+        options.config_file = CONFIG_FILES
+
+    VERBOSE = bool(options.verbose)
+
+    algos = getAlgorithms()
+    filterCiphers(algos)
+
+    update = False
+    for fn in options.config_file:
+        if fixConfig(algos, fn):
+            update = True
+
+    if update:
+        info()
+        info('If everything works as expected, you may want to remove all'
+             ' backup files located in the same directory as %s' % cff)
+
+if __name__ == '__main__':
+    main()
