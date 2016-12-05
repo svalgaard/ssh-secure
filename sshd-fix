@@ -201,13 +201,16 @@ def fixConfig(algos, config_file):
 
     if 'sshd' in config_file:
         # maybe restart service
-        if os.path.isfile('/usr/bin/systemctl'):
-            cmd = ('/usr/bin/systemctl', 'restart', 'sshd.service')
-        elif os.path.isfile('/etc/init.d/sshd'):
-            cmd = ('/etc/init.d/sshd', 'restart')
+        for cmd in [
+                ('/usr/bin/systemctl', 'restart', 'sshd.service'),
+                ('/bin/systemctl', 'restart', 'sshd.service'),
+                ('/etc/init.d/sshd', 'restart'),
+                ('/etc/init.d/ssh', 'restart')]:
+            if os.path.isfile(cmd[0]):
+                break
         else:
             info('Remember to restart sshd to apply the changes')
-            return
+            return True
 
         info(*cmd)
         if confirm('Restart sshd by running the above command?'):
